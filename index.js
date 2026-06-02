@@ -1,142 +1,220 @@
 const mineflayer = require("mineflayer")
 const express = require("express")
+const fs = require("fs")
 
 const app = express()
 app.use(express.json())
 
-let bot = null
-let connecting = false
+/* ========== CONFIG ========== */
+const SERVER_HOST = "allaysmp.pro"
+const SERVER_COMMAND = "/joinqueue economy"
+const JUMP_INTERVAL = 5000
+/* ============================ */
+
+let bots = {}
+let botState = {}
 let logs = []
 
-function addLog(msg) {
+/* ---------- UTILS ---------- */
+function log(msg) {
   const line = `[${new Date().toLocaleTimeString()}] ${msg}`
   console.log(line)
   logs.push(line)
-  if (logs.length > 300) logs.shift()
+  if (logs.length > 500) logs.shift()
+}
+
+function loadAccounts() {
+  return JSON.parse(fs.readFileSync("./accounts.json", "utf8"))
 }
 
 /* ---------- BOT ---------- */
-function joinBot() {
-  if (bot || connecting) {
-    addLog("Join ignored (already online or connecting)")
-    return
-  }
+function startBot(acc) {
+  if (bots[acc.name]) return
 
-  connecting = true
-  addLog("Starting bot...")
+  botState[acc.name] = botState[acc.name] || { autoRejoin: true }
+  botState[acc.name].status = "CONNECTING"
+  log(`Starting ${acc.name}`)
 
-  bot = mineflayer.createBot({
-    host: "allaysmp.pro",
-    username: "Xacrifizee_",
+  const bot = mineflayer.createBot({
+    host: SERVER_HOST,
+    username: acc.name,
     version: false
   })
 
+  bots[acc.name] = bot
+
   bot.once("spawn", () => {
-    connecting = false
-    addLog("Bot spawned")
+    botState[acc.name].status = "ONLINE"
+    log(`${acc.name} spawned`)
 
-    setTimeout(() => bot.chat("/login <kurt>"), 3000)
-    setTimeout(() => bot.chat("/joinqueue economy"), 6000)
+    setTimeout(() => bot.chat(acc.loginCommand), 3000)
+    setTimeout(() => bot.chat(SERVER_COMMAND), 6000)
 
-    bot.jumpInterval = setInterval(() => {
+    bot.jumpTimer = setInterval(() => {
       bot.setControlState("jump", true)
       setTimeout(() => bot.setControlState("jump", false), 200)
-    }, 5000)
+    }, JUMP_INTERVAL)
   })
 
-  bot.on("chat", (u, m) => addLog(`<${u}> ${m}`))
+  bot.on("chat", (u, m) => log(`<${u}> ${m}`))
 
   bot.on("end", () => {
-    addLog("Bot disconnected")
-    if (bot?.jumpInterval) clearInterval(bot.jumpInterval)
-    bot = null
-    connecting = false
+    log(`${acc.name} disconnected`)
+    clearInterval(bot.jumpTimer)
+    delete bots[acc.name]
+    botState[acc.name].status = "OFFLINE"
+
+    if (botState[acc.name].autoRejoin) {
+      log(`${acc.name} rejoining in 10s`)
+      setTimeout(() => startBot(acc), 10000)
+    }
   })
 
-  bot.on("error", e => addLog("Error: " + e.message))
+  bot.on("error", e => log(`${acc.name} error: ${e.message}`))
 }
 
-function leaveBot() {
-  if (!bot) {
-    addLog("Leave ignored (bot offline)")
-    return
-  }
-  addLog("Bot leaving")
-  if (bot.jumpInterval) clearInterval(bot.jumpInterval)
-  bot.quit()
-  bot = null
+function stopBot(name) {
+  if (!bots[name]) return
+  botState[name].autoRejoin = false
+  bots[name].quit()
+  delete bots[name]
+  botState[name].status = "OFFLINE"
+  log(`Stopped ${name}`)
 }
 
 /* ---------- WEBSITE ---------- */
 app.get("/", (req, res) => {
-  res.send(`
-<!DOCTYPE html>
+res.send(`<!DOCTYPE html>
 <html>
 <head>
-  <title>AFK Bot Control</title>
-  <style>
-    body { background:#111;color:#0f0;font-family:monospace;padding:20px }
-    button,input { padding:8px;margin:4px;background:#000;color:#0f0;border:1px solid #0f0 }
-    #logs { height:300px;overflow:auto;background:#000;padding:10px;white-space:pre-wrap }
-  </style>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AFK Bot Panel</title>
+<style>
+body{
+  margin:0;
+  font-family:system-ui;
+  background:#0b0f1a;
+  color:#eaeaff;
+  padding:20px
+}
+.card{
+  background:#151a30;
+  border-radius:16px;
+  padding:14px;
+  margin-bottom:10px
+}
+.bot{
+  display:flex;
+  justify-content:space-between;
+  align-items:center
+}
+.status{
+  font-size:12px;
+  padding:4px 10px;
+  border-radius:999px
+}
+.online{background:#1f5;color:#000}
+.offline{background:#f44}
+.connecting{background:#77f}
+button{
+  background:#7c7cff;
+  border:none;
+  padding:8px 12px;
+  border-radius:10px;
+  margin-left:4px;
+  cursor:pointer
+}
+#logs{
+  background:#000;
+  height:260px;
+  overflow:auto;
+  padding:10px;
+  font-family:monospace;
+  font-size:12px
+}
+</style>
 </head>
 <body>
-  <h2>AFK Bot Control (Render)</h2>
 
-  <button onclick="fetch('/join')">JOIN</button>
-  <button onclick="fetch('/leave')">LEAVE</button><br>
+<h2>⚡ AFK BOT PANEL</h2>
 
-  <input id="msg" placeholder="chat or command">
-  <button onclick="send()">SEND</button>
+<div id="bots"></div>
 
-  <div id="logs"></div>
+<h3>Chat</h3>
+<input id="bot" placeholder="Bot name"><br><br>
+<input id="msg" placeholder="Message or command"><br><br>
+<button onclick="sendChat()">SEND</button>
+
+<h3>Logs</h3>
+<div id="logs"></div>
 
 <script>
-async function send() {
-  const m = msg.value
-  msg.value = ""
-  if (!m) return
-  await fetch("/chat", {
-    method: "POST",
-    headers: { "Content-Type":"application/json" },
-    body: JSON.stringify({ message: m })
-  })
-}
-
-async function loadLogs() {
-  const r = await fetch("/logs")
-  logs.textContent = await r.text()
+async function update(){
+  const s = await fetch('/status').then(r=>r.json())
+  bots.innerHTML=''
+  for(const n in s){
+    const st=s[n]
+    const c=st.status==="ONLINE"?"online":st.status==="CONNECTING"?"connecting":"offline"
+    bots.innerHTML+=\`
+      <div class="card bot">
+        <div>
+          <b>\${n}</b><br>
+          <span class="status \${c}">\${st.status} · AR \${st.autoRejoin?'ON':'OFF'}</span>
+        </div>
+        <div>
+          <button onclick="fetch('/join/\${n}')">JOIN</button>
+          <button onclick="fetch('/leave/\${n}')">LEAVE</button>
+          <button onclick="fetch('/toggle/\${n}')">AUTO</button>
+        </div>
+      </div>\`
+  }
+  logs.textContent = await fetch('/logs').then(r=>r.text())
   logs.scrollTop = logs.scrollHeight
 }
 
-setInterval(loadLogs, 1000)
-loadLogs()
+async function sendChat(){
+  await fetch('/chat',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({bot:bot.value,msg:msg.value})
+  })
+}
+
+setInterval(update,1000)
+update()
 </script>
+
 </body>
-</html>
-`)
+</html>`)
 })
 
-app.get("/join", (req, res) => {
-  joinBot()
+/* ---------- API ---------- */
+app.get("/join/:name", (req,res)=>{
+  const acc = loadAccounts().find(a=>a.name===req.params.name)
+  if (acc) startBot(acc)
   res.send("OK")
 })
 
-app.get("/leave", (req, res) => {
-  leaveBot()
+app.get("/leave/:name", (req,res)=>{
+  stopBot(req.params.name)
   res.send("OK")
 })
 
-app.post("/chat", (req, res) => {
-  if (!bot) return res.send("Bot offline")
-  bot.chat(req.body.message)
-  addLog("You: " + req.body.message)
+app.get("/toggle/:name", (req,res)=>{
+  botState[req.params.name].autoRejoin =
+    !botState[req.params.name].autoRejoin
   res.send("OK")
 })
 
-app.get("/logs", (req, res) => {
-  res.send(logs.join("\n"))
+app.post("/chat", (req,res)=>{
+  const {bot,msg} = req.body
+  if (bots[bot]) bots[bot].chat(msg)
+  res.send("OK")
 })
 
+app.get("/logs", (req,res)=>res.send(logs.join("\n")))
+app.get("/status", (req,res)=>res.json(botState))
+
+/* ---------- START ---------- */
 const PORT = process.env.PORT || 3000
-app.listen(PORT, () => addLog("Web server running on " + PORT))
+app.listen(PORT, ()=>log("Server running on " + PORT))
